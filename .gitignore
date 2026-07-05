@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+bench/results_*.json
+.venv/
+
+# venv created in the project root
+/bin/
+/lib/
+/lib64
+/include/
+/share/
+pyvenv.cfg
+
+.DS_Store
+.remember/

@@ -1,0 +1,24 @@
+[project]
+name = "tinyserve"
+version = "0.1.0"
+description = "A mini LLM inference engine: continuous batching, paged KV cache, chunked prefill — from scratch in PyTorch"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "transformers>=4.45",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+server = ["fastapi", "uvicorn", "sse-starlette"]
+dev = ["pytest", "numpy"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tinyserve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
