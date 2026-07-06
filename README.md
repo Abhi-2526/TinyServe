@@ -2,7 +2,7 @@
 
 A mini LLM inference engine built from scratch in PyTorch — continuous batching, paged KV cache, chunked prefill — benchmarked against vLLM.
 
-**Status: Week 1** — correct single-sequence engine with explicit KV-cache management.
+**Status: Week 2** — continuous (iteration-level) batching over a slot-based KV cache, with a Poisson load generator and TTFT/ITL metrics.
 
 ## Why
 
@@ -21,6 +21,13 @@ python examples/generate.py --model Qwen/Qwen2.5-1.5B-Instruct
 
 # Record the naive baseline (every later chart is relative to this)
 python bench/baseline_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
+
+# Continuous batching under Poisson load (GPU)
+python bench/run_tinyserve.py --model Qwen/Qwen2.5-1.5B-Instruct \
+    --num-requests 50 --rate 2.0 --max-batch-size 8
+
+# Same load, static batching — the comparison that motivates Week 2
+python bench/run_tinyserve.py --mode static --num-requests 50 --rate 2.0
 ```
 
 ## Architecture
@@ -29,11 +36,12 @@ python bench/baseline_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
 tinyserve/
 ├── model.py      # Llama-arch forward pass, explicit KV-cache plumbing
 │                 #   (state-dict compatible with HF Llama 3.x / Qwen2.x)
-├── kv_cache.py   # Week 1: contiguous cache. Week 3: paged (block tables)
+├── kv_cache.py   # Week 2: slot-based cache (one slab per sequence). Week 3: paged
 ├── sampler.py    # greedy / temperature / top-p
-├── engine.py     # prefill + decode loop
-tests/            # the correctness gate — token-exact vs HF, runs in CI on CPU
-bench/            # baselines and load generator
+├── request.py    # Request lifecycle + per-token timing (TTFT/ITL)
+├── engine.py     # Engine (single-seq reference) + BatchEngine (continuous batching)
+tests/            # correctness gate (vs HF) + batching gate (vs Engine)
+bench/            # baselines, Poisson load generator, metrics
 ```
 
 ## The correctness gate
@@ -43,7 +51,7 @@ bench/            # baselines and load generator
 ## Roadmap
 
 - [x] Week 1 — correct engine: explicit KV cache, prefill/decode split, correctness gate, naive baseline numbers
-- [ ] Week 2 — static → continuous (iteration-level) batching; Poisson load generator
+- [x] Week 2 — static → continuous (iteration-level) batching; Poisson load generator
 - [ ] Week 3 — paged KV cache: block allocator, block tables, preemption
 - [ ] Week 4 — chunked prefill; OpenAI-compatible streaming server; benchmark vs vLLM (TTFT/ITL p50/p99, goodput @ SLO)
 - [ ] Week 5 — ablation study, writeup

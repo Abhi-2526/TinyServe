@@ -91,14 +91,15 @@ def random_prompt(vocab_size, length, seed=0):
 @torch.inference_mode()
 def test_prefill_logits_match(models):
     hf_model, ts_model = models
-    from tinyserve.kv_cache import ContiguousKVCache
+    from tinyserve.kv_cache import SlotKVCache
 
     prompt = random_prompt(ts_model.cfg.vocab_size, 33)
-    cache = ContiguousKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
-    ids = torch.tensor(prompt)
-    ts_logits = ts_model(ids, torch.arange(len(prompt)), cache)
+    cache = SlotKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
+    ids = torch.tensor([prompt])
+    slot = torch.tensor([0])
+    ts_logits = ts_model(ids, torch.arange(len(prompt)).unsqueeze(0), cache, slot)[0]
 
-    hf_logits = hf_model(ids.unsqueeze(0)).logits.squeeze(0)
+    hf_logits = hf_model(ids).logits.squeeze(0)
     torch.testing.assert_close(ts_logits, hf_logits, atol=1e-4, rtol=1e-4)
 
 
@@ -129,22 +130,22 @@ def test_greedy_generation_token_exact(models):
 def test_decode_matches_prefill(models):
     """Incremental decode over cached history must equal a fresh full forward pass."""
     _, ts_model = models
-    from tinyserve.kv_cache import ContiguousKVCache
+    from tinyserve.kv_cache import SlotKVCache
 
     tokens = random_prompt(ts_model.cfg.vocab_size, 24, seed=42)
+    slot = torch.tensor([0])
 
     # Incremental: prefill 20, then decode 4 one at a time
-    cache = ContiguousKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
-    ids = torch.tensor(tokens[:20])
-    ts_model(ids, torch.arange(20), cache)
-    cache.advance(20)
+    cache = SlotKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
+    ts_model(torch.tensor([tokens[:20]]), torch.arange(20).unsqueeze(0), cache, slot)
+    cache.advance(slot, 20)
     last = None
     for i in range(20, 24):
-        last = ts_model(torch.tensor([tokens[i]]), torch.tensor([i]), cache)
-        cache.advance(1)
+        last = ts_model(torch.tensor([[tokens[i]]]), torch.tensor([[i]]), cache, slot)
+        cache.advance(slot, 1)
 
     # Fresh full pass
-    cache2 = ContiguousKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
-    full = ts_model(torch.tensor(tokens), torch.arange(24), cache2)
+    cache2 = SlotKVCache.for_model(ts_model.cfg, 512, "cpu", torch.float32)
+    full = ts_model(torch.tensor([tokens]), torch.arange(24).unsqueeze(0), cache2, slot)
 
-    torch.testing.assert_close(last[-1], full[-1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(last[0, -1], full[0, -1], atol=1e-4, rtol=1e-4)

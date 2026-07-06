@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kv_cache import KVCache
+from .kv_cache import SlotKVCache
 
 
 @dataclass
@@ -122,8 +122,8 @@ class RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """positions: (T,) int64 -> cos, sin each (T, head_dim), float32."""
-        freqs = torch.outer(positions.to(torch.float32), self.inv_freq)
+        """positions: (B, T) int64 -> cos, sin each (B, T, head_dim), float32."""
+        freqs = positions.to(torch.float32).unsqueeze(-1) * self.inv_freq  # (B, T, D/2)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
@@ -134,9 +134,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_rope(q, k, cos, sin):
-    """q: (T, H, D), k: (T, KVH, D); cos/sin: (T, D)."""
-    cos = cos.unsqueeze(1).to(q.dtype)
-    sin = sin.unsqueeze(1).to(q.dtype)
+    """q: (B, T, H, D), k: (B, T, KVH, D); cos/sin: (B, T, D)."""
+    cos = cos.unsqueeze(2).to(q.dtype)
+    sin = sin.unsqueeze(2).to(q.dtype)
     q = q * cos + _rotate_half(q) * sin
     k = k * cos + _rotate_half(k) * sin
     return q, k
@@ -169,37 +169,47 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=cfg.qkv_bias)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x, cos, sin, cache: KVCache) -> torch.Tensor:
-        """x: (T, C). Appends this step's K/V to `cache` and attends over the full history."""
-        T = x.shape[0]
-        q = self.q_proj(x).view(T, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(T, self.n_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(T, self.n_kv_heads, self.head_dim)
+    def forward(self, x, cos, sin, cache: SlotKVCache, slot_ids: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, C). Appends this step's K/V to `cache` and attends over full history.
+
+        Supported shapes: prefill (B=1, T=n) and batched decode (B=n, T=1).
+        """
+        B, T = x.shape[0], x.shape[1]
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
         q, k = _apply_rope(q, k, cos, sin)
 
-        k_all, v_all = cache.append(self.layer_idx, k, v)  # (S, KVH, D)
-        S = k_all.shape[0]
+        k_all, v_all, kv_lens = cache.append(self.layer_idx, k, v, slot_ids)  # (B, S, KVH, D)
+        S = k_all.shape[1]
 
-        # (1, heads, seq, dim) for SDPA
-        q = q.permute(1, 0, 2).unsqueeze(0)
-        k_all = k_all.permute(1, 0, 2).unsqueeze(0)
-        v_all = v_all.permute(1, 0, 2).unsqueeze(0)
+        # (B, heads, seq, dim) for SDPA
+        q = q.permute(0, 2, 1, 3)
+        k_all = k_all.permute(0, 2, 1, 3)
+        v_all = v_all.permute(0, 2, 1, 3)
         if self.n_rep > 1:
             k_all = k_all.repeat_interleave(self.n_rep, dim=1)
             v_all = v_all.repeat_interleave(self.n_rep, dim=1)
 
-        if T == S:
+        if B == 1 and T == S:
+            # Prefill from empty history: plain causal attention, no padding.
             out = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=True)
         elif T == 1:
-            out = F.scaled_dot_product_attention(q, k_all, v_all)
+            # Batched decode: histories differ in length; k_all is padded to the
+            # longest, so mask out positions beyond each sequence's kv_len.
+            j = torch.arange(S, device=x.device)
+            mask = (j[None, :] < kv_lens[:, None]).view(B, 1, 1, S)
+            out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask)
         else:
-            # General case (chunked prefill): query i may attend to kv j iff j <= (S - T) + i
+            # Single sequence with existing history (chunked prefill, Week 4):
+            # query i may attend to kv j iff j <= (S - T) + i
+            assert B == 1
             j = torch.arange(S, device=x.device)
             i = torch.arange(T, device=x.device)
-            mask = j[None, :] <= (i[:, None] + (S - T))
+            mask = (j[None, :] <= (i[:, None] + (S - T))).view(1, 1, T, S)
             out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask)
 
-        out = out.squeeze(0).permute(1, 0, 2).reshape(T, -1)
+        out = out.permute(0, 2, 1, 3).reshape(B, T, -1)
         return self.o_proj(out)
 
 
@@ -222,8 +232,8 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, x, cos, sin, cache: KVCache) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache)
+    def forward(self, x, cos, sin, cache: SlotKVCache, slot_ids) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache, slot_ids)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -238,11 +248,11 @@ class LlamaModel(nn.Module):
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.rotary = RotaryEmbedding(cfg)
 
-    def forward(self, token_ids, positions, cache: KVCache) -> torch.Tensor:
+    def forward(self, token_ids, positions, cache: SlotKVCache, slot_ids) -> torch.Tensor:
         x = self.embed_tokens(token_ids)
         cos, sin = self.rotary(positions)
         for layer in self.layers:
-            x = layer(x, cos, sin, cache)
+            x = layer(x, cos, sin, cache, slot_ids)
         return self.norm(x)
 
 
@@ -257,9 +267,9 @@ class Transformer(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, token_ids, positions, cache: KVCache) -> torch.Tensor:
-        """token_ids, positions: (T,). Returns logits (T, vocab)."""
-        hidden = self.model(token_ids, positions, cache)
+    def forward(self, token_ids, positions, cache: SlotKVCache, slot_ids) -> torch.Tensor:
+        """token_ids, positions: (B, T); slot_ids: (B,). Returns logits (B, T, vocab)."""
+        hidden = self.model(token_ids, positions, cache, slot_ids)
         return self.lm_head(hidden)
 
     def load_hf_state_dict(self, state_dict: dict) -> None:
@@ -283,7 +293,11 @@ class Transformer(nn.Module):
 
         cfg = ModelConfig.from_hf(model_name_or_path)
         model = cls(cfg).to(dtype)
-        hf = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype)
+        hf = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=dtype)
         model.load_hf_state_dict(hf.state_dict())
         del hf
-        return model.to(device).eval()
+        model = model.to(device).eval()
+        # .to(dtype) above also cast the RoPE inv_freq buffer (e.g. to bf16),
+        # which skews rotation angles at long positions. HF keeps it fp32.
+        model.model.rotary.inv_freq = _compute_inv_freq(cfg).to(device)
+        return model
