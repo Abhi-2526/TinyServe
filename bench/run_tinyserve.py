@@ -32,6 +32,10 @@ def main():
     ap.add_argument("--max-batch-size", type=int, default=8)
     ap.add_argument("--max-seq-len", type=int, default=2048)
     ap.add_argument("--mode", choices=["continuous", "static"], default="continuous")
+    ap.add_argument("--kv", choices=["paged", "slot"], default="paged")
+    ap.add_argument("--block-size", type=int, default=16)
+    ap.add_argument("--kv-memory-gb", type=float, default=None,
+                    help="cap physical KV memory; forces preemption under pressure")
     ap.add_argument("--prompt-len-mean", type=int, default=128)
     ap.add_argument("--output-len-mean", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0)
@@ -46,6 +50,9 @@ def main():
         max_batch_size=args.max_batch_size,
         max_seq_len=args.max_seq_len,
         mode=args.mode,
+        kv=args.kv,
+        block_size=args.block_size,
+        kv_memory_gb=args.kv_memory_gb,
     )
 
     wl = make_workload(
@@ -80,12 +87,19 @@ def main():
     elapsed = time.perf_counter() - start
 
     report = {
-        "system": f"tinyserve_{args.mode}",
+        "system": f"tinyserve_{args.mode}_{args.kv}",
         "model": args.model,
         "rate_req_s": args.rate,
         "max_batch_size": args.max_batch_size,
+        "kv": args.kv,
         **summarize(engine.finished, elapsed),
+        "num_preemptions": engine.num_preemptions,
     }
+    if args.kv == "paged":
+        report["block_size"] = args.block_size
+        report["num_blocks"] = engine.cache.num_blocks
+        gb = engine.cache.k.element_size() * (engine.cache.k.numel() + engine.cache.v.numel()) / 2**30
+        report["kv_memory_gb"] = round(gb, 2)
     print(json.dumps(report, indent=2))
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)

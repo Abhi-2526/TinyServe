@@ -27,6 +27,7 @@ class Request:
     slot: int = -1
     next_token: int = -1               # sampled but not yet fed back through the model
     finish_reason: str = ""
+    num_preemptions: int = 0           # times evicted from the batch (Week 3, paged KV)
 
     # --- timing (absolute perf_counter timestamps) ---
     t_submitted: float = 0.0
