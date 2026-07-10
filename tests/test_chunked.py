@@ -66,8 +66,12 @@ def test_chunked_prefill_matches_full(model):
         cache_chunk.advance(slot, end - start)
 
     torch.testing.assert_close(last[0, -1], full[0, -1], atol=1e-12, rtol=1e-12)
-    # And the caches themselves must hold identical KV.
-    torch.testing.assert_close(cache_chunk.k[:, 0, :23], cache_full.k[:, 0, :23], atol=0, rtol=0)
+    # The caches must hold the same KV — but not bitwise: torch picks matmul
+    # kernels by input shape, so a 23-row projection and a 6-row chunk can
+    # reduce in different orders (1-ULP diffs on some CPUs, e.g. the GitHub
+    # Actions runner). 1e-14 is ~100x above ULP noise and far below any real
+    # bug (a wrong position or RoPE angle shows up at O(1)).
+    torch.testing.assert_close(cache_chunk.k[:, 0, :23], cache_full.k[:, 0, :23], atol=1e-14, rtol=1e-14)
 
 
 def make_requests(model, n, seed_base=0, prompt_base=8):
