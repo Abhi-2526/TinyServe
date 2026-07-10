@@ -28,6 +28,7 @@ class Request:
     next_token: int = -1               # sampled but not yet fed back through the model
     finish_reason: str = ""
     num_preemptions: int = 0           # times evicted from the batch (Week 3, paged KV)
+    num_prefilled: int = 0             # prompt tokens whose KV is computed (Week 4, chunked prefill)
 
     # --- timing (absolute perf_counter timestamps) ---
     t_submitted: float = 0.0

@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--block-size", type=int, default=16)
     ap.add_argument("--kv-memory-gb", type=float, default=None,
                     help="cap physical KV memory; forces preemption under pressure")
+    ap.add_argument("--chunk-size", type=int, default=None,
+                    help="chunked prefill: max prompt tokens processed between decode steps")
     ap.add_argument("--prompt-len-mean", type=int, default=128)
     ap.add_argument("--output-len-mean", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0)
@@ -53,6 +55,7 @@ def main():
         kv=args.kv,
         block_size=args.block_size,
         kv_memory_gb=args.kv_memory_gb,
+        prefill_chunk_size=args.chunk_size,
     )
 
     wl = make_workload(
@@ -77,7 +80,11 @@ def main():
     while pending or engine.has_work():
         now = time.perf_counter() - start
         while pending and pending[0].arrival_time <= now:
-            engine.submit(pending.pop(0))
+            r = pending.pop(0)
+            engine.submit(r)
+            # Measure TTFT from the SCHEDULED arrival, not from whenever this
+            # loop got around to submitting — matches run_vllm.py's stamping.
+            r.t_submitted = start + r.arrival_time
         if engine.has_work():
             engine.step()
         elif pending:
@@ -92,6 +99,7 @@ def main():
         "rate_req_s": args.rate,
         "max_batch_size": args.max_batch_size,
         "kv": args.kv,
+        "chunk_size": args.chunk_size,
         **summarize(engine.finished, elapsed),
         "num_preemptions": engine.num_preemptions,
     }

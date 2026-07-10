@@ -12,6 +12,11 @@ BatchEngine  — Week 2: step()-based engine with iteration-level (continuous)
                latest-admitted request is evicted (blocks freed, requeued)
                and later resumed by re-prefilling prompt + generated-so-far
                (vLLM's "recompute" preemption).
+               Week 4: prefill_chunk_size bounds how much prefill work runs
+               between consecutive decode steps. Without it, a 1000-token
+               prompt arriving mid-flight stalls every running sequence for
+               one giant forward pass (ITL p99 spike); with it, the prompt is
+               processed in chunks interleaved with decode steps.
 """
 
 from __future__ import annotations
@@ -118,6 +123,7 @@ class BatchEngine:
         block_size: int = 16,
         num_blocks: int | None = None,
         kv_memory_gb: float | None = None,
+        prefill_chunk_size: int | None = None,
     ) -> None:
         assert mode in ("continuous", "static")
         assert kv in ("slot", "paged")
@@ -139,7 +145,9 @@ class BatchEngine:
             self.cache = SlotKVCache.for_model(
                 self.cfg, max_seq_len, self.device, self.dtype, num_slots=max_batch_size
             )
+        self.prefill_chunk_size = prefill_chunk_size
         self.waiting: deque[Request] = deque()
+        self.prefilling: list[Request] = []  # admitted, KV not fully computed yet
         self.running: list[Request] = []
         self.finished: list[Request] = []
         self.num_preemptions = 0
@@ -156,15 +164,27 @@ class BatchEngine:
         self.waiting.append(req)
 
     def has_work(self) -> bool:
-        return bool(self.waiting or self.running)
+        return bool(self.waiting or self.prefilling or self.running)
 
     @torch.inference_mode()
     def step(self) -> None:
-        """One scheduler iteration: admit, then decode one token for everyone."""
+        """One scheduler iteration: admit -> prefill work -> one decode for all.
+
+        With prefill_chunk_size set, at most ONE chunk of prefill runs per
+        step, so running sequences never wait longer than one chunk-sized
+        forward between decode steps (bounded ITL)."""
         # -- admission (FCFS: stop at the first request that doesn't fit) --
-        if self.mode == "continuous" or not self.running:
+        if self.mode == "continuous" or not (self.running or self.prefilling):
             while self.waiting and self.cache.can_admit(self._num_tokens(self.waiting[0])):
-                self._prefill(self.waiting.popleft())
+                self._admit(self.waiting.popleft())
+
+        # -- prefill work --
+        if self.prefilling:
+            if self.prefill_chunk_size is None:
+                while self.prefilling:  # Week 2/3 behavior: full prompts up front
+                    self._prefill_chunk(self.prefilling[0])
+            else:
+                self._prefill_chunk(self.prefilling[0])
 
         # -- batched decode --
         if self.running:
@@ -182,38 +202,57 @@ class BatchEngine:
 
     # ---- internals ----
 
-    def _prefill(self, req: Request) -> None:
+    def _admit(self, req: Request) -> None:
+        """Give the request a slot and reserve KV blocks for its whole prompt
+        (a resumed request's "prompt" includes tokens generated pre-eviction).
+        Decode growth beyond that is still claimed step by step."""
         req.slot = self.cache.alloc()
         req.state = "running"
+        req.num_prefilled = 0
         slot = torch.tensor([req.slot], dtype=torch.long, device=self.device)
-        # Resumed request: recompute KV for prompt + tokens generated before
-        # preemption (its KV was discarded when it was evicted).
+        if not self.cache.reserve(slot, self._num_tokens(req)):
+            raise RuntimeError("admission reserve failed after can_admit — scheduler bug")
+        self.prefilling.append(req)
+
+    def _prefill_chunk(self, req: Request) -> None:
+        """Run one chunk of prefill (or the whole remainder if chunking is off).
+        On the final chunk, sample the first output token and move to running."""
         tokens = req.prompt_ids + req.output_ids
-        n = len(tokens)
-        if not self.cache.reserve(slot, n):
-            raise RuntimeError("prefill reserve failed after can_admit — scheduler bug")
-        ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
-        positions = torch.arange(n, device=self.device).unsqueeze(0)
+        start = req.num_prefilled
+        end = len(tokens) if self.prefill_chunk_size is None else min(
+            start + self.prefill_chunk_size, len(tokens)
+        )
+        slot = torch.tensor([req.slot], dtype=torch.long, device=self.device)
+        ids = torch.tensor([tokens[start:end]], dtype=torch.long, device=self.device)
+        positions = torch.arange(start, end, device=self.device).unsqueeze(0)
         logits = self.model(ids, positions, self.cache, slot)
-        self.cache.advance(slot, n)
-        token = Engine._sample(req, logits[0, -1])
-        self._commit(req, token, time.perf_counter())
-        if req.state == "running":
-            self.running.append(req)
+        self.cache.advance(slot, end - start)
+        req.num_prefilled = end
+
+        if end == len(tokens):
+            self.prefilling.remove(req)
+            token = Engine._sample(req, logits[0, -1])
+            self._commit(req, token, time.perf_counter())
+            if req.state == "running":
+                self.running.append(req)
 
     def _decode_step(self) -> None:
         # Claim one more token of KV memory for every running sequence; if the
-        # paged cache is out of blocks, evict the latest-admitted request and
-        # retry (it re-enters at the FRONT of the waiting queue).
+        # paged cache is out of blocks, evict someone and retry. Victim order:
+        # prefilling requests first (they haven't produced visible tokens this
+        # round), then the latest-admitted running request.
         while True:
             slot_ids = torch.tensor(
                 [r.slot for r in self.running], dtype=torch.long, device=self.device
             )
             if self.cache.reserve(slot_ids, 1):
                 break
-            if len(self.running) == 1:
+            if self.prefilling:
+                self._preempt(self.prefilling[-1])
+            elif len(self.running) > 1:
+                self._preempt(self.running[-1])
+            else:
                 raise RuntimeError("single request cannot fit — submit() guard violated")
-            self._preempt(self.running[-1])
 
         batch = self.running
         ids = torch.tensor([[r.next_token] for r in batch], dtype=torch.long, device=self.device)
@@ -243,22 +282,28 @@ class BatchEngine:
             req.next_token = token
 
     def _preempt(self, req: Request) -> None:
-        """Evict a running request: discard its KV, requeue it at the front.
+        """Evict an admitted request: discard its KV, requeue it at the front.
 
-        Its generated tokens are kept on the Request; on re-admission,
-        _prefill recomputes the KV from prompt + output (recompute-style
-        preemption — trades extra compute for freed memory)."""
-        self.running.remove(req)
+        Its generated tokens are kept on the Request; on re-admission, the KV
+        is recomputed from prompt + output (recompute-style preemption —
+        trades extra compute for freed memory)."""
+        if req in self.prefilling:
+            self.prefilling.remove(req)
+        else:
+            self.running.remove(req)
         self.cache.free(req.slot)
         req.slot = -1
         req.state = "waiting"
+        req.num_prefilled = 0
         req.num_preemptions += 1
         self.num_preemptions += 1
         self.waiting.appendleft(req)
 
     def _finish(self, req: Request, reason: str) -> None:
-        req.state = "finished"
+        # Order matters: the server thread polls `state` — everything else
+        # must already be consistent when it flips to "finished".
         req.finish_reason = reason
+        req.state = "finished"
         self.cache.free(req.slot)
         req.slot = -1
         self.finished.append(req)
